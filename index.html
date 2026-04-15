@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Iterative Coding Canvas</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="hud" id="hudPanel">
+    <div class="hudTop">
+      <button id="toggleHudBtn" type="button" class="mini">Minimizar panel</button>
+    </div>
+
+    <div id="hudFull">
+      <h1>Iterative Reading · Multi-escala</h1>
+      <p>Pan: arrastrar · Zoom: rueda o pinza · El texto cambia su abstracción según escala.</p>
+    </div>
+
+    <p id="cameraInfo" class="camera"></p>
+
+    <div class="controls" id="controlsPanel">
+      <label for="docTitle">Título</label>
+      <input id="docTitle" type="text" placeholder="Ej: Artículo sobre volcanes" />
+
+      <label for="sourceInput">Texto para postprocesar</label>
+      <textarea id="sourceInput" rows="4" placeholder="Pegá aquí un párrafo y tocá Guardar en base"></textarea>
+
+      <button id="saveDocBtn" type="button">Guardar en base</button>
+      <p id="saveStatus" class="status"></p>
+
+      <div class="listHead">
+        <strong>Textos disponibles</strong>
+        <div>
+          <button id="selectAllBtn" type="button" class="mini">Todos</button>
+          <button id="selectNoneBtn" type="button" class="mini">Ninguno</button>
+        </div>
+      </div>
+      <div id="docList" class="docList"></div>
+    </div>
+  </div>
+
+  <canvas id="board" aria-label="Canvas principal"></canvas>
+
+  <script src="app.js"></script>
+</body>
+</html>
