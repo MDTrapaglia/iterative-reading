@@ -14,6 +14,13 @@ const selectNoneBtn = document.getElementById('selectNoneBtn')
 
 const STORAGE_KEY = 'iterative_reading_user_docs_v1'
 const HUD_MINIMIZED_KEY = 'iterative_reading_hud_minimized_v1'
+const AI_SUMMARY_ENDPOINT = 'api/summarize'
+const PARAGRAPH_BREAK_TOKEN = '__PARA_BREAK__'
+const TEXT_CLEANING_VERSION = 2
+const AI_BACKEND_MAX_CHARS = 24000
+const AI_DIRECT_SAFE_MAX_CHARS = 21000
+const AI_CHUNK_MAX_CHARS = 9000
+const AI_CHUNK_OVERLAP_UNITS = 1
 
 const camera = {
   x: 80,
@@ -123,6 +130,30 @@ function slugify(text) {
     .replace(/(^-|-$)+/g, '')
 }
 
+function cleanImportedText(rawText) {
+  let text = String(rawText || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00ad/g, '')
+
+  text = text.replace(/([A-Za-zÁÉÍÓÚÜÑáéíóúüñ])-\n(?=[a-záéíóúüñ])/g, '$1')
+  text = text.replace(/[ \t]+\n/g, '\n')
+  text = text.replace(/\n{3,}/g, '\n\n')
+
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+
+  return paragraphs.join('\n\n')
+}
+
+function splitParagraphs(text) {
+  return String(text || '')
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+}
+
 function splitSentences(text) {
   return text
     .replace(/\s+/g, ' ')
@@ -132,39 +163,512 @@ function splitSentences(text) {
     .filter(Boolean)
 }
 
-function shortenSentence(sentence, maxWords = 14) {
-  const words = sentence.split(' ')
-  if (words.length <= maxWords) return sentence
-  return `${words.slice(0, maxWords).join(' ')}…`
+function expandParagraphsForReadability(paragraphs) {
+  const expanded = []
+
+  paragraphs.forEach((paragraph, idx) => {
+    const sentenceCandidates = splitSentences(paragraph)
+    const sentenceSource = sentenceCandidates.length ? sentenceCandidates : [paragraph]
+
+    sentenceSource.forEach((sentence) => {
+      expanded.push(...splitLongSentence(sentence, 24))
+    })
+
+    if (idx < paragraphs.length - 1) expanded.push(PARAGRAPH_BREAK_TOKEN)
+  })
+
+  return expanded
 }
 
-function fuseSentencePair(a, b, maxWords = 20) {
-  const joined = `${a} ${b}`.trim()
-  return shortenSentence(joined, maxWords)
+function splitLongSentence(sentence, maxWords = 24) {
+  const words = sentence.split(' ').filter(Boolean)
+  if (words.length <= maxWords) return [sentence]
+
+  const clauseChunks = sentence
+    .split(/[,;:]\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+
+  if (clauseChunks.length > 1) return clauseChunks
+
+  const chunks = []
+  for (let i = 0; i < words.length; i += maxWords) {
+    chunks.push(words.slice(i, i + maxWords).join(' '))
+  }
+  return chunks
+}
+
+function expandSentencesForReadability(sentences) {
+  const expanded = []
+  sentences.forEach((sentence) => {
+    expanded.push(...splitLongSentence(sentence, 24))
+  })
+  return expanded
+}
+
+function tokenizeForRanking(text) {
+  const stopwords = new Set([
+    'de',
+    'la',
+    'el',
+    'los',
+    'las',
+    'y',
+    'o',
+    'u',
+    'en',
+    'con',
+    'para',
+    'por',
+    'un',
+    'una',
+    'unos',
+    'unas',
+    'del',
+    'al',
+    'que',
+    'se',
+    'su',
+    'sus',
+    'es',
+    'son',
+    'como',
+    'más',
+    'mas',
+    'también',
+    'entre',
+    'desde',
+    'hasta',
+    'sobre',
+    'sin',
+    'ya',
+    'muy',
+    'este',
+    'esta',
+    'estos',
+    'estas',
+    'ese',
+    'esa',
+    'esos',
+    'esas',
+    'lo',
+    'end',
+  ])
+
+  return (text.toLowerCase().match(/[a-záéíóúñü]{3,}/g) || []).filter((word) => !stopwords.has(word))
+}
+
+function rankSentencesByKeywords(sentences) {
+  const frequency = new Map()
+
+  sentences.forEach((sentence) => {
+    tokenizeForRanking(sentence).forEach((word) => {
+      frequency.set(word, (frequency.get(word) || 0) + 1)
+    })
+  })
+
+  return sentences
+    .map((sentence, index) => {
+      const score = tokenizeForRanking(sentence).reduce((acc, word) => acc + (frequency.get(word) || 0), 0)
+      return { sentence, index, score }
+    })
+    .sort((a, b) => b.score - a.score)
+}
+
+function pickRepresentativeLines(sentences, targetCount) {
+  if (!sentences.length) return []
+  if (sentences.length <= targetCount) return sentences
+
+  const ranked = rankSentencesByKeywords(sentences)
+  const selected = ranked
+    .slice(0, targetCount)
+    .sort((a, b) => a.index - b.index)
+    .map((item) => item.sentence)
+
+  return selected
+}
+
+function buildEssenceLine(rawText, fallbackSentence) {
+  const frequency = new Map()
+  tokenizeForRanking(rawText).forEach((word) => {
+    frequency.set(word, (frequency.get(word) || 0) + 1)
+  })
+
+  const keywords = [...frequency.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([word]) => word)
+
+  if (keywords.length >= 3) {
+    const [a, b, c] = keywords
+    return `En síntesis, el texto destaca ${a}, ${b} y ${c}.`
+  }
+
+  if (fallbackSentence) {
+    const clean = fallbackSentence.replace(/\s+/g, ' ').trim()
+    return clean.endsWith('.') ? clean : `${clean}.`
+  }
+
+  return 'En síntesis, el texto presenta una idea central clara.'
 }
 
 function buildAbstractionLevelsFromText(rawText) {
-  const sentences = splitSentences(rawText)
-  if (!sentences.length) return null
+  const cleanedText = cleanImportedText(rawText)
+  const paragraphs = splitParagraphs(cleanedText)
+  if (!paragraphs.length) return null
 
-  const detailed = sentences
-  const synthetic = sentences.map((s) => shortenSentence(s, 16))
+  const sentencePool = paragraphs.flatMap((paragraph) => splitSentences(paragraph)).filter(Boolean)
+  const sentenceSource = sentencePool.length ? sentencePool : paragraphs
 
-  const grouped = []
-  for (let i = 0; i < synthetic.length; i += 2) {
-    grouped.push(fuseSentencePair(synthetic[i], synthetic[i + 1] || '', 18))
-  }
+  const detailed = expandParagraphsForReadability(paragraphs)
 
-  const paragraphSummary = [shortenSentence(grouped.join(' '), 16)]
-  const essence = [shortenSentence(paragraphSummary[0], 9)]
+  const rankedCandidates = expandSentencesForReadability(sentenceSource)
+  const syntheticTarget = clamp(Math.ceil(rankedCandidates.length * 0.7), 1, 8)
+  const groupedTarget = clamp(Math.ceil(rankedCandidates.length * 0.4), 1, 5)
+
+  const synthetic = pickRepresentativeLines(rankedCandidates, syntheticTarget)
+  const grouped = pickRepresentativeLines(rankedCandidates, groupedTarget)
+
+  const paragraphSummary = pickRepresentativeLines(rankedCandidates, 1)
+  const essence = [buildEssenceLine(cleanedText, paragraphSummary[0])]
 
   return [
     { lines: detailed },
-    { lines: synthetic.length ? synthetic : detailed },
+    { lines: synthetic.length ? synthetic : rankedCandidates },
     { lines: grouped.length ? grouped : synthetic },
-    { lines: paragraphSummary },
+    { lines: paragraphSummary.length ? paragraphSummary : grouped },
     { lines: essence },
   ]
+}
+
+function normalizeAiLevels(levels) {
+  if (!Array.isArray(levels) || levels.length !== 5) return null
+
+  const normalized = levels.map((level) => {
+    const incomingLines = Array.isArray(level?.lines) ? level.lines : []
+    const lines = []
+
+    incomingLines.forEach((rawLine) => {
+      const cleanLine = String(rawLine || '').replace(/\r\n?/g, '\n').trim()
+      if (!cleanLine) return
+
+      const splitByParagraph = cleanLine
+        .split(/\n\s*\n/)
+        .map((part) => part.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+
+      splitByParagraph.forEach((part, idx) => {
+        lines.push(part)
+        if (idx < splitByParagraph.length - 1) lines.push(PARAGRAPH_BREAK_TOKEN)
+      })
+    })
+
+    return { lines }
+  })
+
+  if (normalized.some((level) => level.lines.filter((line) => line !== PARAGRAPH_BREAK_TOKEN).length === 0)) {
+    return null
+  }
+  return normalized
+}
+
+async function buildAbstractionLevelsWithAI(rawText, title) {
+  const cleanedText = cleanImportedText(rawText)
+  if (!cleanedText) throw new Error('empty_clean_text')
+
+  const response = await fetch(AI_SUMMARY_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: cleanedText, title }),
+  })
+
+  if (!response.ok) {
+    let errorPayload = null
+    try {
+      errorPayload = await response.json()
+    } catch {
+      errorPayload = null
+    }
+
+    const error = new Error(
+      `ai_http_${response.status}${errorPayload?.error ? `_${errorPayload.error}` : ''}`,
+    )
+    error.httpStatus = response.status
+    error.code = errorPayload?.error || null
+    error.maxChars = Number(errorPayload?.max_chars) || null
+    throw error
+  }
+
+  const payload = await response.json()
+  const normalized = normalizeAiLevels(payload?.levels)
+  if (!normalized) throw new Error('ai_invalid_schema')
+  return normalized
+}
+
+function buildSafeLevels(seedLine = 'Sin contenido disponible.') {
+  return [
+    { lines: [seedLine] },
+    { lines: [seedLine] },
+    { lines: [seedLine] },
+    { lines: [seedLine] },
+    { lines: [seedLine] },
+  ]
+}
+
+function splitLargeTextPiece(text, maxChars) {
+  const cleanText = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!cleanText) return []
+  if (cleanText.length <= maxChars) return [cleanText]
+
+  const sentences = splitSentences(cleanText)
+  if (sentences.length > 1) {
+    const pieces = []
+    let buffer = ''
+
+    sentences.forEach((sentence) => {
+      const candidate = buffer ? `${buffer} ${sentence}` : sentence
+      if (candidate.length <= maxChars) {
+        buffer = candidate
+        return
+      }
+
+      if (buffer) pieces.push(buffer.trim())
+
+      if (sentence.length <= maxChars) {
+        buffer = sentence
+        return
+      }
+
+      for (let i = 0; i < sentence.length; i += maxChars) {
+        const part = sentence.slice(i, i + maxChars).trim()
+        if (part) pieces.push(part)
+      }
+      buffer = ''
+    })
+
+    if (buffer) pieces.push(buffer.trim())
+    return pieces.filter(Boolean)
+  }
+
+  const parts = []
+  for (let i = 0; i < cleanText.length; i += maxChars) {
+    const part = cleanText.slice(i, i + maxChars).trim()
+    if (part) parts.push(part)
+  }
+  return parts
+}
+
+function chunkTextForAI(cleanedText, maxChars = AI_CHUNK_MAX_CHARS, overlapUnits = AI_CHUNK_OVERLAP_UNITS) {
+  const paragraphs = splitParagraphs(cleanedText)
+  const units = paragraphs.flatMap((paragraph) => splitLargeTextPiece(paragraph, maxChars))
+  if (!units.length) return []
+
+  const chunks = []
+  let start = 0
+
+  while (start < units.length) {
+    let end = start
+    let chunkText = ''
+
+    while (end < units.length) {
+      const candidate = chunkText ? `${chunkText}\n\n${units[end]}` : units[end]
+      if (candidate.length > maxChars && chunkText) break
+      chunkText = candidate
+      end += 1
+    }
+
+    chunks.push({
+      text: chunkText.trim(),
+      startUnit: start,
+      endUnit: end,
+    })
+
+    if (end >= units.length) break
+    start = Math.max(end - overlapUnits, start + 1)
+  }
+
+  return chunks
+}
+
+function trimBreakEdges(lines) {
+  const out = [...lines]
+  while (out.length && out[0] === PARAGRAPH_BREAK_TOKEN) out.shift()
+  while (out.length && out[out.length - 1] === PARAGRAPH_BREAK_TOKEN) out.pop()
+  return out
+}
+
+function mergeLevelsFromChunkResults(chunkResults) {
+  const levelLineLimits = [220, 120, 70, 30, 10]
+
+  return Array.from({ length: 5 }, (_, levelIndex) => {
+    const merged = []
+
+    chunkResults.forEach((chunkResult, idx) => {
+      const lines = Array.isArray(chunkResult?.levels?.[levelIndex]?.lines)
+        ? chunkResult.levels[levelIndex].lines
+        : []
+
+      lines.forEach((line) => {
+        const cleanLine = String(line || '').trim()
+        if (!cleanLine) return
+
+        if (cleanLine === PARAGRAPH_BREAK_TOKEN) {
+          if (merged.length && merged[merged.length - 1] !== PARAGRAPH_BREAK_TOKEN) {
+            merged.push(PARAGRAPH_BREAK_TOKEN)
+          }
+          return
+        }
+
+        if (merged[merged.length - 1] !== cleanLine) {
+          merged.push(cleanLine)
+        }
+      })
+
+      if (idx < chunkResults.length - 1 && merged.length && merged[merged.length - 1] !== PARAGRAPH_BREAK_TOKEN) {
+        merged.push(PARAGRAPH_BREAK_TOKEN)
+      }
+    })
+
+    const trimmed = trimBreakEdges(merged)
+    const nonBreakLines = trimmed.filter((line) => line !== PARAGRAPH_BREAK_TOKEN)
+
+    if (!nonBreakLines.length) {
+      return { lines: ['Sin contenido disponible.'] }
+    }
+
+    if (nonBreakLines.length <= levelLineLimits[levelIndex]) {
+      return { lines: trimmed }
+    }
+
+    return {
+      lines: pickRepresentativeLines(nonBreakLines, levelLineLimits[levelIndex]),
+    }
+  })
+}
+
+async function summarizeWithChunking(cleanedText, title) {
+  const chunks = chunkTextForAI(cleanedText)
+  if (!chunks.length) {
+    const heuristicLevels = buildAbstractionLevelsFromText(cleanedText) || buildSafeLevels()
+    return {
+      levels: heuristicLevels,
+      summaryEngine: 'heuristic',
+      usedAI: false,
+      fallbackReason: 'chunking_no_units',
+      fallbackMaxChars: null,
+      chunkCount: 0,
+      chunkAiCount: 0,
+      chunkFallbackCount: 0,
+      usedChunking: false,
+    }
+  }
+
+  const chunkResults = []
+  let chunkAiCount = 0
+  let chunkFallbackCount = 0
+  let fallbackReason = null
+  let fallbackMaxChars = null
+
+  for (let idx = 0; idx < chunks.length; idx += 1) {
+    const chunk = chunks[idx]
+    saveStatusEl.textContent = `Procesando IA por bloques (${idx + 1}/${chunks.length})…`
+
+    try {
+      const levels = await buildAbstractionLevelsWithAI(chunk.text, `${title} · tramo ${idx + 1}/${chunks.length}`)
+      chunkResults.push({ levels, engine: 'ai' })
+      chunkAiCount += 1
+    } catch (error) {
+      fallbackReason = error?.code || error?.message || 'ai_error'
+      fallbackMaxChars = Number(error?.maxChars) || null
+      const heuristicLevels = buildAbstractionLevelsFromText(chunk.text) || buildSafeLevels()
+      chunkResults.push({ levels: heuristicLevels, engine: 'heuristic' })
+      chunkFallbackCount += 1
+      console.warn('[iterative-reading] chunk summarize failed, fallback to heuristic', idx, error)
+    }
+  }
+
+  let levels = null
+  let usedReduceAI = false
+  const reduceInput = chunkResults
+    .map((chunkResult, idx) => {
+      const lines = Array.isArray(chunkResult?.levels?.[3]?.lines) ? chunkResult.levels[3].lines : []
+      return `Tramo ${idx + 1}: ${lines.filter((line) => line !== PARAGRAPH_BREAK_TOKEN).join(' ')}`
+    })
+    .join('\n\n')
+
+  if (reduceInput.trim()) {
+    try {
+      saveStatusEl.textContent = 'Unificando resumen global con IA…'
+      levels = await buildAbstractionLevelsWithAI(reduceInput, `${title} · síntesis global`)
+      usedReduceAI = true
+    } catch (error) {
+      fallbackReason = fallbackReason || error?.code || error?.message || 'reduce_ai_error'
+      console.warn('[iterative-reading] reduce summarize failed, fallback to merged chunks', error)
+    }
+  }
+
+  if (!levels) {
+    levels = mergeLevelsFromChunkResults(chunkResults)
+  }
+
+  const summaryEngine = usedReduceAI
+    ? chunkFallbackCount === 0
+      ? 'ai_chunked'
+      : 'mixed_chunked'
+    : chunkAiCount > 0
+      ? 'mixed_chunked'
+      : 'heuristic'
+
+  return {
+    levels,
+    summaryEngine,
+    usedAI: chunkAiCount > 0 || usedReduceAI,
+    fallbackReason,
+    fallbackMaxChars,
+    chunkCount: chunks.length,
+    chunkAiCount,
+    chunkFallbackCount,
+    usedChunking: true,
+  }
+}
+
+async function summarizeDocumentWithPipeline(cleanedText, title) {
+  if (cleanedText.length <= Math.min(AI_DIRECT_SAFE_MAX_CHARS, AI_BACKEND_MAX_CHARS)) {
+    try {
+      const levels = await buildAbstractionLevelsWithAI(cleanedText, title)
+      return {
+        levels,
+        summaryEngine: 'ai',
+        usedAI: true,
+        fallbackReason: null,
+        fallbackMaxChars: null,
+        chunkCount: 1,
+        chunkAiCount: 1,
+        chunkFallbackCount: 0,
+        usedChunking: false,
+      }
+    } catch (error) {
+      const reason = error?.code || error?.message || 'ai_error'
+      const maxChars = Number(error?.maxChars) || null
+
+      if (reason !== 'text_too_long') {
+        const heuristicLevels = buildAbstractionLevelsFromText(cleanedText) || buildSafeLevels()
+        return {
+          levels: heuristicLevels,
+          summaryEngine: 'heuristic',
+          usedAI: false,
+          fallbackReason: reason,
+          fallbackMaxChars: maxChars,
+          chunkCount: 1,
+          chunkAiCount: 0,
+          chunkFallbackCount: 1,
+          usedChunking: false,
+        }
+      }
+    }
+  }
+
+  return summarizeWithChunking(cleanedText, title)
 }
 
 function loadUserDocs() {
@@ -173,7 +677,62 @@ function loadUserDocs() {
     if (!raw) return []
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
-    return parsed.filter((d) => d?.id && d?.title && Array.isArray(d?.levels))
+
+    const migrated = parsed
+      .filter((d) => d?.id && d?.title && Array.isArray(d?.levels))
+      .map((doc) => {
+        const hasValidLevels =
+          Array.isArray(doc.levels) &&
+          doc.levels.length === 5 &&
+          doc.levels.every(
+            (level) =>
+              Array.isArray(level?.lines) && level.lines.some((line) => String(line || '').trim().length > 0),
+          )
+
+        if (!hasValidLevels) {
+          if (doc.sourceText) {
+            const rebuilt = buildAbstractionLevelsFromText(doc.sourceText)
+            if (rebuilt) {
+              return {
+                ...doc,
+                levels: rebuilt,
+                summaryEngine: doc.summaryEngine || 'heuristic',
+              }
+            }
+          }
+
+          const seedLine =
+            (doc.levels || [])
+              .flatMap((level) => (Array.isArray(level?.lines) ? level.lines : []))
+              .map((line) => String(line || '').trim())
+              .find(Boolean) || 'Sin contenido disponible.'
+
+          const safeLevels = buildSafeLevels(seedLine)
+
+          return {
+            ...doc,
+            levels: safeLevels,
+            summaryEngine: doc.summaryEngine || 'heuristic',
+          }
+        }
+
+        const hasLegacyEllipsis = doc.levels?.some((level) =>
+          Array.isArray(level?.lines) && level.lines.some((line) => /…|\.\.\./.test(line)),
+        )
+
+        if (!hasLegacyEllipsis || !doc.sourceText) return doc
+
+        const rebuiltLevels = buildAbstractionLevelsFromText(doc.sourceText)
+        if (!rebuiltLevels) return doc
+
+        return {
+          ...doc,
+          levels: rebuiltLevels,
+        }
+      })
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated))
+    return migrated
   } catch {
     return []
   }
@@ -181,6 +740,44 @@ function loadUserDocs() {
 
 function saveUserDocs() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(userDocs))
+}
+
+function shouldReprocessWithAI(doc) {
+  if (!doc?.sourceText) return false
+  const aiLikeEngines = new Set(['ai', 'ai_chunked', 'mixed_chunked'])
+  if (!aiLikeEngines.has(doc.summaryEngine)) return true
+  return (doc.textCleanVersion || 0) < TEXT_CLEANING_VERSION
+}
+
+async function reprocessLegacyDocsWithAI() {
+  const candidates = userDocs.filter((doc) => shouldReprocessWithAI(doc))
+  if (!candidates.length) return
+
+  let updatedCount = 0
+  saveStatusEl.textContent = `Reprocesando ${candidates.length} texto(s) previos con IA…`
+
+  for (const doc of candidates) {
+    try {
+      const cleanedText = cleanImportedText(doc.sourceText)
+      const summaryResult = await summarizeDocumentWithPipeline(cleanedText, doc.title)
+      doc.sourceText = cleanedText
+      doc.levels = summaryResult.levels
+      doc.summaryEngine = summaryResult.summaryEngine
+      doc.textCleanVersion = TEXT_CLEANING_VERSION
+      updatedCount += 1
+    } catch (error) {
+      console.warn('[iterative-reading] no se pudo reprocesar doc con IA', doc?.title, error)
+    }
+  }
+
+  if (updatedCount > 0) {
+    saveUserDocs()
+    renderDocList()
+    saveStatusEl.textContent = `Reprocesado con IA: ${updatedCount}/${candidates.length} texto(s).`
+    return
+  }
+
+  saveStatusEl.textContent = 'No se pudo reprocesar con IA los textos previos; se mantiene versión actual.'
 }
 
 function isHudMinimized() {
@@ -226,7 +823,8 @@ function getAbstractionBlend(scale) {
 
   const low = ABSTRACTION_LEVELS[baseIndex].minScale
   const high = ABSTRACTION_LEVELS[baseIndex - 1].minScale
-  const progress = clamp((scale - low) / (high - low), 0, 1)
+  const hasFiniteRange = Number.isFinite(low) && Number.isFinite(high) && high > low
+  const progress = hasFiniteRange ? clamp((scale - low) / (high - low), 0, 1) : 0
 
   return {
     coarseIndex: baseIndex,
@@ -310,7 +908,8 @@ function wrapText(text, maxWidth) {
 }
 
 function drawParagraphCard(block, abstractionIndex, options = {}) {
-  const level = block.levels[abstractionIndex]
+  const safeIndex = clamp(abstractionIndex, 0, Math.max(0, block.levels.length - 1))
+  const level = block.levels[safeIndex] || { lines: ['Sin contenido disponible.'] }
   const alpha = options.alpha ?? 1
   const stageScale = options.stageScale ?? 1
 
@@ -328,14 +927,24 @@ function drawParagraphCard(block, abstractionIndex, options = {}) {
 
   const wrappedParagraph = []
   level.lines.forEach((line) => {
+    if (line === PARAGRAPH_BREAK_TOKEN) {
+      wrappedParagraph.push(PARAGRAPH_BREAK_TOKEN)
+      return
+    }
+
     const wrapped = wrapText(line, maxTextWidth)
     wrappedParagraph.push(...wrapped)
     wrappedParagraph.push('')
   })
-  if (wrappedParagraph.length > 0) wrappedParagraph.pop()
+  if (wrappedParagraph.length > 0 && wrappedParagraph[wrappedParagraph.length - 1] === '') wrappedParagraph.pop()
 
-  const bodyLines = wrappedParagraph.length
-  const cardHeight = padY * 2 + titleSize + 14 + bodyLines * (bodySize + lineGap)
+  const bodyUnits = wrappedParagraph.reduce((acc, line) => {
+    if (line === PARAGRAPH_BREAK_TOKEN) return acc + 1.8
+    if (!line) return acc + 0.9
+    return acc + 1
+  }, 0)
+
+  const cardHeight = padY * 2 + titleSize + 14 + bodyUnits * (bodySize + lineGap)
   const centerX = block.x + block.width / 2
   const centerY = block.y + cardHeight / 2
 
@@ -359,10 +968,25 @@ function drawParagraphCard(block, abstractionIndex, options = {}) {
   ctx.font = `${bodySize}px Inter, system-ui, sans-serif`
   let y = block.y + padY + titleSize + 18
   wrappedParagraph.forEach((line) => {
-    if (!line) {
-      y += bodySize * 0.55
+    if (line === PARAGRAPH_BREAK_TOKEN) {
+      y += bodySize * 0.95
+      ctx.save()
+      ctx.strokeStyle = 'rgba(215,228,255,0.36)'
+      ctx.lineWidth = 1.2 / textZoomFactor
+      ctx.beginPath()
+      ctx.moveTo(block.x + padX, y)
+      ctx.lineTo(block.x + block.width - padX, y)
+      ctx.stroke()
+      ctx.restore()
+      y += bodySize * 0.95
       return
     }
+
+    if (!line) {
+      y += bodySize * 0.7
+      return
+    }
+
     y += bodySize + lineGap
     ctx.fillText(line, block.x + padX, y)
   })
@@ -496,7 +1120,8 @@ function renderDocList() {
 
     const textWrap = document.createElement('span')
     const shortId = doc.id.startsWith('user-') ? 'usuario' : 'base'
-    textWrap.innerHTML = `<strong>${doc.title}</strong><div class="meta">${shortId} · ${doc.levels[0].lines.length} líneas detalladas</div>`
+    const detailedLineCount = (doc.levels?.[0]?.lines || []).filter((line) => line !== PARAGRAPH_BREAK_TOKEN).length
+    textWrap.innerHTML = `<strong>${doc.title}</strong><div class="meta">${shortId} · ${detailedLineCount} líneas detalladas</div>`
 
     row.appendChild(checkbox)
     row.appendChild(textWrap)
@@ -504,29 +1129,82 @@ function renderDocList() {
   })
 }
 
-function handleSaveDoc() {
+async function handleSaveDoc() {
   const rawText = sourceInputEl.value.trim()
   if (!rawText) {
     saveStatusEl.textContent = 'Pegá un texto antes de guardar.'
     return
   }
 
-  const levels = buildAbstractionLevelsFromText(rawText)
+  const cleanedText = cleanImportedText(rawText)
+  if (!cleanedText) {
+    saveStatusEl.textContent = 'No pude limpiar el texto de entrada.'
+    return
+  }
+
+  const title = docTitleEl.value.trim() || 'Texto importado'
+
+  let levels = null
+  let usedAI = false
+  let summaryEngine = 'heuristic'
+  let fallbackReason = null
+  let fallbackMaxChars = null
+  let chunkCount = 1
+  let chunkAiCount = 0
+  let chunkFallbackCount = 0
+  let usedChunking = false
+
+  saveStatusEl.textContent = 'Procesando resumen con IA…'
+
+  const summaryResult = await summarizeDocumentWithPipeline(cleanedText, title)
+  levels = summaryResult.levels
+  usedAI = summaryResult.usedAI
+  summaryEngine = summaryResult.summaryEngine
+  fallbackReason = summaryResult.fallbackReason
+  fallbackMaxChars = summaryResult.fallbackMaxChars
+  chunkCount = summaryResult.chunkCount
+  chunkAiCount = summaryResult.chunkAiCount
+  chunkFallbackCount = summaryResult.chunkFallbackCount
+  usedChunking = summaryResult.usedChunking
+
   if (!levels) {
     saveStatusEl.textContent = 'No pude procesar el texto.'
     return
   }
 
-  const title = docTitleEl.value.trim() || 'Texto importado'
   const id = `user-${Date.now()}-${slugify(title).slice(0, 22) || 'texto'}`
 
-  userDocs.push({ id, title, sourceText: rawText, levels })
+  userDocs.push({
+    id,
+    title,
+    sourceText: cleanedText,
+    levels,
+    summaryEngine,
+    textCleanVersion: TEXT_CLEANING_VERSION,
+  })
   saveUserDocs()
   visibleDocIds.add(id)
 
   docTitleEl.value = ''
   sourceInputEl.value = ''
-  saveStatusEl.textContent = 'Guardado en base local y disponible para visualizar.'
+
+  if (summaryEngine === 'ai') {
+    saveStatusEl.textContent = 'Guardado con resumen por IA (Codex) en base local.'
+  } else if (usedChunking && chunkCount > 1) {
+    if (chunkFallbackCount === 0) {
+      saveStatusEl.textContent = `Guardado con IA por bloques (${chunkCount} tramos) y síntesis global.`
+    } else {
+      saveStatusEl.textContent = `Guardado por bloques (${chunkAiCount}/${chunkCount} con IA, ${chunkFallbackCount} fallback heurístico).`
+    }
+  } else {
+    saveStatusEl.textContent = usedAI
+      ? 'Guardado con resumen mixto (IA + fallback local).'
+      : String(fallbackReason).includes('text_too_long')
+        ? `Guardado en base local (fallback heurístico: el texto supera el límite de ${
+            fallbackMaxChars || 'la IA'
+          } caracteres para IA).`
+        : 'Guardado en base local (fallback heurístico por error de IA).'
+  }
 
   renderDocList()
 }
@@ -667,4 +1345,5 @@ window.addEventListener('resize', resize)
 resize()
 applyHudState(isHudMinimized())
 renderDocList()
+void reprocessLegacyDocsWithAI()
 render()
